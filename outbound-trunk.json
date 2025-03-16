@@ -1,0 +1,9 @@
+{
+    "trunk": {
+      "name": "My outbound trunk",
+      "address": "annen.pstn.twilio.com",
+      "numbers": ["+16203043975"],
+      "auth_username": "eray",
+      "auth_password": "Eray200582882831*"
+    }
+  }
