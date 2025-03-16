@@ -4,4 +4,5 @@ livekit-plugins-openai>=0.10.9
 livekit-plugins-deepgram>=0.6.13
 livekit-plugins-silero>=0.7.4
 python-dotenv~=1.0
-supabase~=1.0.3
+supabase>=2.0.0
+aiofiles>=23.2.1
