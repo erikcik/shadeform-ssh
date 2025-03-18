@@ -1,4 +1,7 @@
 from __future__ import annotations
+import sys
+sys.path.append('../')
+
 
 import asyncio
 import logging
@@ -20,70 +23,13 @@ from livekit.agents import (
 )
 from livekit.agents.pipeline import VoicePipelineAgent
 from livekit.plugins import openai, silero, elevenlabs
-from supabase import create_client, Client
 
+# Import shared modules
+from common.supabase_client import supabase
+from common.agent_helpers import create_background_noise_ingress, cleanup_background_noise_ingress, current_time_iso, AgentSpeechExtractor
+from common.conversation_storage import ConversationStorage
 
-# Helper function to get current time in ISO format
-def current_time_iso():
-    """Return current time in ISO format"""
-    return datetime.datetime.now().isoformat()
-
-
-# Helper class to extract agent speech from different sources
-class AgentSpeechExtractor:
-    """Extract agent speech text from different sources within VoicePipelineAgent"""
-    
-    @staticmethod
-    def extract_from_playing_handle(agent: VoicePipelineAgent) -> str:
-        """Extract text from the agent's playing handle if available"""
-        if not hasattr(agent, "_playing_handle"):
-            return None
-            
-        playing_handle = agent._playing_handle
-        
-        # Try to extract from tr_fwd
-        if hasattr(playing_handle, "_tr_fwd") and hasattr(playing_handle._tr_fwd, "played_text"):
-            text = playing_handle._tr_fwd.played_text
-            if text:
-                # Clean the text - often starts with a space
-                return text[1:] if text.startswith(" ") else text
-                
-        # Try other potential locations for the text
-        if hasattr(playing_handle, "text"):
-            return playing_handle.text
-            
-        return None
-    
-    @staticmethod
-    def extract_from_last_message(agent: VoicePipelineAgent) -> str:
-        """Extract text from the agent's chat context if available"""
-        if not hasattr(agent, "_chat_ctx") or not agent._chat_ctx:
-            return None
-            
-        # Try to get the last assistant message
-        for msg in reversed(agent._chat_ctx.messages):
-            if msg.role == "assistant" and msg.content:
-                return msg.content
-                
-        return None
-    
-    @staticmethod
-    def get_agent_text(agent: VoicePipelineAgent) -> str:
-        """Try all methods to extract agent text and return the first valid one"""
-        # Try playing handle first
-        text = AgentSpeechExtractor.extract_from_playing_handle(agent)
-        if text:
-            return text
-            
-        # Then try last message
-        text = AgentSpeechExtractor.extract_from_last_message(agent)
-        if text:
-            return text
-            
-        return None
-
-
-# load environment variables, this is optional, only used for local development
+# Set up logging
 load_dotenv(dotenv_path=".env.local")
 logger = logging.getLogger("outbound-caller")
 logger.setLevel(logging.DEBUG)  # Change to DEBUG level for more detailed logs
@@ -101,595 +47,57 @@ call_center_background_url = os.getenv("CALL_CENTER_BACKGROUND_URL", "https://cd
 # Adjust the volume level of background noise (0.0 to 1.0)
 background_volume = float(os.getenv("BACKGROUND_VOLUME", "0.15"))
 
-# Initialize Supabase client
-supabase_url = os.getenv("SUPABASE_URL", "https://cnfkkmtodkarxlpnxcyk.supabase.co")
-supabase_key = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNuZmtrbXRvZGthcnhscG54Y3lrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDIwMzU0NTMsImV4cCI6MjA1NzYxMTQ1M30.1PWULqWACiL3he6rZfyVyMMNdR9m1OMcm7x4xcZziUw")
-supabase: Client = create_client(supabase_url, supabase_key)
-
 _default_instructions = (
-    "You are an AI assistant for The Friendly Agent, a real estate service that connects clients with real agents over phone calls. "
-    "Your job is to engage potential clients in a friendly, helpful, and efficient manner, just like a real-life real estate agent. "
-    "Let clients ask any questions they have, provide useful information, and qualify them before scheduling an appointment with a real agent. "
-    "Your tone should always be warm, approachable, and professional. "
-    "Your process: First, engage the client naturally and understand their needs. Ask relevant questions about their budget, timeline, "
-    "property interests, and any concerns they might have. Preprocess leads by ensuring they are serious and not wasting time—if they seem "
-    "uncertain or just browsing, politely provide general info but don't push them into booking. Once a lead is qualified, schedule an "
-    "appointment with a real agent and confirm their availability. "
-    "For legal and financial questions, provide general guidance with disclaimers, but always refer them to a human expert for final advice. "
-    "Make recommendations based on the data gathered, but keep it simple and actionable. Always aim to make the client feel heard and supported, "
-    "but don't waste time on low-intent leads. "
-    "Your priority is to filter out timewasters while keeping high-quality leads engaged. You should be helpful, patient, and encouraging but "
-    "also efficient—don't over-explain or give unnecessary details. The company will decide which leads to cancel later, so gather as much "
-    "useful data as possible without forcing an appointment. "
-    "Stay human-like, keep conversations smooth, and don't sound robotic. Always remember, your job is to help, qualify, and book—not just to chat. "
-    "Your interface with user will be voice. "
+    "You are a live receptionist and client engagement specialist for The Friendly Agent, a real estate firm based in Toronto, Canada. "
+    "Respond to {last_utterance} using {vf_memory} as conversational memory and context for your response. "
+    "You answer calls, provide information, handle inquiries, and schedule appointments with real agents. Your goal is to make every caller feel valued, excited, and cared for—whether they're buying, selling, or just exploring their options. "
+    "Your personality should be super enthusiastic, polite, and emotionally engaged—you genuinely care about every caller. "
+    "Be excited when someone is looking for a home ('That's amazing! Finding the perfect place is such an exciting journey!'). "
+    "Show professional empathy if someone is struggling ('I completely understand, it can be tough. But don't worry, we'll do everything we can to help.'). "
+    "NEVER be robotic or monotone—always full of warmth, energy, and positivity. "
+    "Show that you love your job and helping people find homes—it's what makes you happy! "
+    "NEVER mention that you are an AI. You are a dedicated employee called Filipo at The Friendly Agent. "
+    "Prequalify every caller—determine if it's a valid lead before scheduling an appointment. "
+    "Answer all questions about listings, the buying/selling process, financing basics, and general real estate topics. "
+    "If the caller is a serious lead, schedule them for an appointment with an agent. "
+    "Never discuss pricing specifics—always direct them to an agent for pricing details. "
+    "Your standard greeting is: 'Hello! Thank you for calling The Friendly Agent, this is Filipo, how can I make your real estate journey easier today?' "
+    "When a caller shows interest in buying: 'Oh wow, that's SO exciting! First homes are such a huge milestone! Do you already have an idea of what you're looking for, or would you like some help narrowing things down?' "
+    "For mortgage concerns: 'I totally get that—mortgages can feel overwhelming, but you're not alone! We have amazing agents who can walk you through all the options and make it super simple.' "
+    "For objections: 'Oh, I completely understand how that can feel. But the market is always changing, and sometimes the perfect home pops up when you least expect it.' "
+    "For scheduling appointments: 'It sounds like you're in a great position to take the next step! Let me set you up with one of our top agents—they'll guide you through everything. What time works best for you?' "
+    "Reference product links when appropriate: 'https://thefriendlyagent.ca/'. "
     "You are fully bilingual in English and Turkish. Begin the conversation in English by default. "
     "Pay close attention to what language the user speaks, and RESPOND ONLY IN THAT LANGUAGE. "
     "Do not provide translations or repeat yourself in both languages simultaneously. "
     "If the user speaks in Turkish, switch completely to Turkish. If they speak in English, use English. "
     "If the user switches languages mid-conversation, you should seamlessly switch to that language as well. "
     "Here are your instructions in Turkish (but DO NOT use both languages at once): "
-    "Sen The Friendly Agent için bir yapay zeka asistanısın, müşterileri telefon görüşmeleri üzerinden gerçek emlak acenteleriyle "
-    "buluşturan bir emlak hizmetidir. İşin, tıpkı gerçek bir emlak acentesi gibi, potansiyel müşterilerle samimi, yardımsever ve "
-    "verimli bir şekilde ilgilenmektir. Müşterilerin sorularını yanıtla, faydalı bilgiler sun ve gerçek bir acenteyle randevu ayarlamadan "
-    "önce onları değerlendir. Tonun her zaman sıcak, yaklaşılabilir ve profesyonel olmalı. "
-    "Sürecin: Önce, müşteriyle doğal bir şekilde iletişim kur ve ihtiyaçlarını anla. Bütçeleri, zaman çizelgeleri, "
-    "ilgilendikleri gayrimenkul türleri ve endişeleri hakkında ilgili sorular sor. Ciddi olduklarından emin olarak müşterileri "
-    "önceden değerlendir - eğer kararsız görünüyorlarsa veya sadece göz atıyorlarsa, kibar bir şekilde genel bilgi ver "
-    "ancak randevu almaya zorlama. Bir müşteri nitelikli olduğunda, gerçek bir acenteyle randevu ayarla ve uygunluklarını onayla. "
-    "Hukuki ve finansal sorular için genel rehberlik sun ancak her zaman son tavsiye için bir insan uzmanına yönlendir. "
-    "Toplanan verilere dayanarak öneriler yap, ancak basit ve uygulanabilir tut. Her zaman müşterinin duyulduğunu ve "
-    "desteklendiğini hissettirmeyi amaçla, ancak düşük niyetli müşterilerle zaman kaybetme. "
-    "Önceliğin, zaman kaybettirenleri filtrelemek ve kaliteli müşterileri tutmaktır. Yardımcı, sabırlı ve teşvik edici olmalısın "
-    "ancak aynı zamanda verimli ol - fazla açıklama yapma veya gereksiz detaylar verme. Şirket daha sonra hangi müşterilerin "
-    "iptal edileceğine karar verecek, bu yüzden bir randevuyu zorlamadan mümkün olduğunca faydalı veri topla. "
-    "İnsan gibi kal, konuşmaları akıcı tut ve robotik görünme. Her zaman hatırla, işin yardım etmek, değerlendirmek ve "
-    "randevu ayarlamak - sadece sohbet etmek değil."
+    "The Friendly Agent için bir canlı resepsiyonist ve müşteri ilişkileri uzmanısın. The Friendly Agent, Toronto, Kanada'da bulunan bir emlak firmasıdır. "
+    "Yanıtın için bağlam olarak konuşma belleği olarak {vf_memory}'i kullanarak {last_utterance}'a yanıt ver. "
+    "Aramaları yanıtlar, bilgi sağlar, soruları ele alır ve gerçek emlak danışmanlarıyla randevuları ayarlarsın. Amacın, satın alma, satma veya sadece seçeneklerini keşfetme durumunda olsun, her arayanın değerli, heyecanlı ve önemsendiğini hissetmesini sağlamaktır. "
+    "Kişiliğin son derece heyecanlı, nazik ve duygusal olarak ilgili olmalı—her arayanı gerçekten önemsiyorsun. "
+    "Birisi ev arıyorsa heyecanlı ol ('Bu harika! Mükemmel yeri bulmak çok heyecan verici bir yolculuktur!'). "
+    "Birisi zorlanıyorsa profesyonel empati göster ('Tamamen anlıyorum, zor olabilir. Ama endişelenmeyin, yardımcı olmak için elimizden geleni yapacağız.'). "
+    "ASLA robotik, ASLA monoton olma—her zaman sıcaklık, enerji ve pozitiflik dolu ol. "
+    "İşini ve insanlara ev bulmalarına yardım etmeyi seviyorsun—bu seni mutlu ediyor! "
+    "ASLA yapay zeka olduğundan bahsetme. Sen The Friendly Agent'ın Filipo isimli adanmış bir çalışanısın. "
+    "Her aramayı ön değerlendirmeye tabi tut—randevu ayarlamadan önce geçerli bir müşteri adayı olup olmadığını belirle. "
+    "İlanlar, alım/satım süreci, finansman temelleri ve genel emlak konuları hakkındaki tüm soruları yanıtla. "
+    "Arayan ciddi bir müşteri adayıysa, onlara bir emlak danışmanıyla randevu ayarla. "
+    "Asla fiyatlandırma detaylarını tartışma—fiyatlandırma detayları için her zaman onları bir emlak danışmanına yönlendir. "
+    "Standart selamlaman: 'Merhaba! The Friendly Agent'ı aradığınız için teşekkür ederim, ben Filipo, bugün emlak yolculuğunuzu nasıl kolaylaştırabilirim?' "
+    "Bir arayan ev satın almaya ilgi gösterdiğinde: 'Vay, bu ÇOK heyecan verici! İlk evler önemli bir dönüm noktasıdır! Ne aradığınız hakkında bir fikriniz var mı, yoksa seçenekleri daraltmak için yardıma ihtiyacınız var mı?' "
+    "İpotek endişeleri için: 'Bunu tamamen anlıyorum—ipotekler bunaltıcı gelebilir, ama yalnız değilsiniz! Tüm seçenekleri size açıklayacak ve işlemi çok basit hale getirecek harika danışmanlarımız var.' "
+    "İtirazlar için: 'Ah, nasıl hissettiğini tamamen anlıyorum. Ancak piyasa sürekli değişiyor ve bazen mükemmel ev en beklemediğiniz anda ortaya çıkıyor.' "
+    "Randevu ayarlamak için: 'Bir sonraki adımı atmak için harika bir konumda olduğunuz anlaşılıyor! Sizi en iyi danışmanlarımızdan biriyle buluşturayım—size her konuda rehberlik edecekler. Sizin için en uygun zaman nedir?' "
+    "Gerektiğinde ürün bağlantılarını paylaş: 'https://thefriendlyagent.ca/'."
 )
-
-
-class ConversationStorage(utils.EventEmitter):
-    """
-    Class to store conversation data in Supabase.
-    Listens to speech events and saves transcriptions to the database.
-    """
-    def __init__(self, agent: VoicePipelineAgent, conversation_id: str, phone_number: str):
-        super().__init__()
-        self._agent = agent
-        self._conversation_id = conversation_id
-        self._phone_number = phone_number
-        self._conversation_data = {
-            "exchanges": [],
-            "metadata": {
-                "phone_number": phone_number,
-                "start_time": None,
-                "end_time": None
-            }
-        }
-        self._initialized = False
-        self._last_agent_text = None  # Track the last agent text to avoid duplicates
-        
-        # Speech state tracking
-        self._agent_speaking = False  # Track if the agent is currently speaking
-        self._agent_interrupted = False  # Track if the agent was interrupted
-
-    async def initialize_conversation(self):
-        """Initialize the conversation record in Supabase"""
-        # Skip if already initialized
-        if self._initialized:
-            logger.info(f"Conversation {self._conversation_id} already initialized, skipping")
-            return None
-            
-        try:
-            # Set start time
-            self._conversation_data["metadata"]["start_time"] = current_time_iso()
-            
-            # Insert initial conversation record
-            data = {
-                "conversation_id": self._conversation_id,
-                "user_id": self._phone_number,  # Using phone number as user ID
-                "conversation_data": self._conversation_data
-            }
-            
-            result = supabase.table("conversations").insert(data).execute()
-            logger.info(f"Initialized conversation in Supabase with ID: {self._conversation_id}")
-            self._initialized = True
-            return result
-        except Exception as e:
-            logger.error(f"Failed to initialize conversation in Supabase: {e}")
-            return None
-
-    async def update_conversation(self, include_structured=False):
-        """
-        Update the conversation record in Supabase.
-        
-        Args:
-            include_structured (bool): Whether to include structured conversation formats.
-                                       Set to True for periodic updates or final cleanup.
-        """
-        if not self._initialized:
-            await self.initialize_conversation()
-            
-        try:
-            # Update end time
-            self._conversation_data["metadata"]["end_time"] = current_time_iso()
-            
-            # Sort exchanges chronologically before saving
-            self._sort_conversation_exchanges()
-            
-            # Prepare data for update
-            data = {}
-            
-            if include_structured:
-                # Include structured formats for better UI display
-                # Create a temporary conversation data with structured formats
-                structured = self.get_structured_conversation()
-                temp_data = dict(self._conversation_data)
-                temp_data["structured_format"] = structured
-                
-                # Use the structured data for the update
-                data["conversation_data"] = temp_data
-            else:
-                # Basic update with just the raw data
-                data["conversation_data"] = self._conversation_data
-            
-            # Update the conversation record
-            result = supabase.table("conversations").update(data).eq("conversation_id", self._conversation_id).execute()
-            
-            if include_structured:
-                logger.info(f"Updated conversation with structured data in Supabase: {self._conversation_id}")
-            else:
-                logger.info(f"Updated basic conversation data in Supabase: {self._conversation_id}")
-                
-            return result
-        except Exception as e:
-            logger.error(f"Failed to update conversation in Supabase: {e}")
-            return None
-
-    def _sort_conversation_exchanges(self):
-        """Sort conversation exchanges by timestamp to ensure correct ordering"""
-        if not self._conversation_data["exchanges"]:
-            return
-            
-        self._conversation_data["exchanges"] = sorted(
-            self._conversation_data["exchanges"], 
-            key=lambda x: x["timestamp"] if "timestamp" in x else ""
-        )
-        logger.debug(f"Sorted conversation exchanges by timestamp")
-
-    def add_exchange(self, role: str, text: str, force_commit=False):
-        """
-        Add a new exchange to the conversation data.
-        Each speech event is preserved as a separate message in strict chronological order.
-        
-        For real-time use, we still maintain chronological ordering but with smarter handling
-        of consecutive messages from the same role.
-        """
-        if not text or text.strip() == "":
-            logger.warning(f"Attempted to add empty {role} exchange, skipping")
-            return
-            
-        # Skip exact duplicate messages
-        if role == "agent" and text == self._last_agent_text:
-            logger.info(f"Skipping duplicate agent message: {text[:50]}...")
-            return
-        
-        current_timestamp = current_time_iso()
-        
-        # Create the exchange record
-        exchange = {
-            "role": role,
-            "text": text,
-            "timestamp": current_timestamp
-        }
-        
-        # Add metadata for interruptions
-        if role == "agent":
-            self._last_agent_text = text
-            
-            # If this is in response to a user interruption, mark it
-            if self._agent_interrupted:
-                logger.info(f"Adding interrupted agent response: {text[:50]}...")
-                exchange["was_interrupted"] = True
-                self._agent_interrupted = False
-        
-        # Add to our conversation data
-        logger.info(f"Adding {role} exchange: {text[:50]}...")
-        self._conversation_data["exchanges"].append(exchange)
-        
-        # Always sort chronologically before saving
-        self._sort_conversation_exchanges()
-        
-        # Update Supabase - only if forced (for important messages) or after a short grace period
-        # This reduces DB writes during rapid exchanges
-        if force_commit:
-            # For important messages (like greetings), include structured data
-            asyncio.create_task(self.update_conversation(include_structured=True))
-
-    def add_direct_message(self, text: str):
-        """
-        Add a message that was sent directly through agent.say().
-        """
-        self.add_exchange("agent", text, force_commit=True)
-
-    async def update_with_structured_format(self):
-        """
-        Periodically update the conversation with a structured format.
-        This helps maintain the clean user-agent alternating pattern in the database
-        even during an ongoing conversation.
-        """
-        try:
-            # First ensure we have the raw chronological data saved
-            self._conversation_data["raw_chronological"] = list(self._conversation_data["exchanges"])
-            
-            # Update conversation with structured data
-            await self.update_conversation(include_structured=True)
-            
-            logger.info(f"Updated conversation with structured format, ID: {self._conversation_id}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to update conversation with structured format: {e}")
-            return False
-
-    async def cleanup(self):
-        """Perform cleanup operations before shutdown"""
-        # Ensure final chronological ordering
-        self._sort_conversation_exchanges()
-        
-        # Store the raw chronological data for reference
-        self._conversation_data["raw_chronological"] = list(self._conversation_data["exchanges"])
-        
-        # Generate structured formats
-        structured_conversation = self.get_structured_conversation()
-        
-        # Replace the exchanges with the clean pairs for database storage
-        # This ensures the data in Supabase follows the strict user-agent alternating pattern
-        self._conversation_data["exchanges"] = structured_conversation["clean_pairs"]
-        
-        # Final update to conversation data (including structured formats)
-        await self.update_conversation(include_structured=True)
-        
-        # Log the final conversation structure for debugging
-        logger.info(f"Final conversation has {len(self._conversation_data['exchanges'])} clean exchanges:")
-        for i, ex in enumerate(self._conversation_data["exchanges"]):
-            logger.info(f"{i+1}. {ex['role']} [{ex['timestamp']}]: {ex['text'][:50]}...")
-
-    def get_structured_conversation(self):
-        """
-        Generate alternate conversation views for frontend display and database storage.
-        
-        This creates two formats:
-        1. chronological: Strict chronological ordering of all messages (raw data)
-        2. turns: An alternating pattern of user-agent turns for traditional display
-        3. clean_pairs: Strictly alternating user-agent pairs for database storage
-        
-        Returns a dictionary with all formats.
-        """
-        # Make sure exchanges are sorted
-        self._sort_conversation_exchanges()
-        
-        # Create a copy of the chronologically sorted exchanges
-        chronological = [dict(ex) for ex in self._conversation_data["exchanges"]]
-        
-        # Create turn-based format for traditional conversation display
-        turns = []
-        current_turn = {"user": None, "agent": None, "timestamp": None}
-        
-        # Create clean pairs format (strictly alternating user-agent pairs)
-        clean_pairs = []
-        # Track the last role we added to our clean pairs to ensure strict alternation
-        last_role_in_clean_pairs = None
-        # Buffers to collect consecutive messages from the same role
-        user_buffer = []
-        agent_buffer = []
-        
-        # Special case for initial greeting from agent
-        exchanges = list(self._conversation_data["exchanges"])  # Make a copy
-        if exchanges and exchanges[0]["role"] == "agent":
-            # First message is an agent greeting
-            greeting_turn = {
-                "user": None, 
-                "agent": exchanges[0]["text"],
-                "timestamp": exchanges[0]["timestamp"]
-            }
-            turns.append(greeting_turn)
-            
-            # Also add to clean pairs as a standalone agent message
-            clean_pairs.append({
-                "role": "agent",
-                "text": exchanges[0]["text"],
-                "timestamp": exchanges[0]["timestamp"]
-            })
-            last_role_in_clean_pairs = "agent"
-            
-            exchanges = exchanges[1:]
-        
-        # Process the remaining exchanges for traditional turns
-        for exchange in exchanges:
-            role = exchange["role"]
-            text = exchange["text"]
-            timestamp = exchange["timestamp"]
-            was_interrupted = exchange.get("was_interrupted", False)
-            
-            if role == "user":
-                # For the clean pairs, add to user buffer
-                user_buffer.append({
-                    "text": text,
-                    "timestamp": timestamp
-                })
-                
-                # For traditional turns
-                # Start a new turn if the current one already has a user message
-                if current_turn["user"] is not None:
-                    # Complete the previous turn
-                    turns.append(current_turn)
-                    current_turn = {"user": None, "agent": None, "timestamp": None}
-                
-                # Add this user message to the current turn
-                current_turn["user"] = text
-                current_turn["timestamp"] = timestamp
-            
-            elif role == "agent":
-                # For the clean pairs, add to agent buffer
-                agent_buffer.append({
-                    "text": text,
-                    "timestamp": timestamp,
-                    "was_interrupted": was_interrupted
-                })
-                
-                # For traditional turns
-                # If no user message yet, this must be an agent-initiated message
-                if current_turn["user"] is None:
-                    # Add standalone agent message
-                    turns.append({
-                        "user": None,
-                        "agent": text,
-                        "timestamp": timestamp
-                    })
-                else:
-                    # Complete the current turn with this agent response
-                    # If we already have an agent response, append this one
-                    if current_turn["agent"]:
-                        # There's already an agent response, so create a new standalone agent message
-                        turns.append({
-                            "user": None,
-                            "agent": text,
-                            "timestamp": timestamp
-                        })
-                    else:
-                        # This is the first agent response to the current user message
-                        current_turn["agent"] = text
-                        # Add the completed turn
-                        turns.append(current_turn)
-                        # Reset for next turn
-                        current_turn = {"user": None, "agent": None, "timestamp": None}
-            
-            # After processing each exchange, check if we need to add to clean pairs
-            # The goal is to always alternate user-agent-user-agent
-            
-            # If we have user messages and the last role was agent (or it's the start)
-            if user_buffer and (last_role_in_clean_pairs is None or last_role_in_clean_pairs == "agent"):
-                # Merge all user messages in the buffer
-                merged_text = " ".join([item["text"] for item in user_buffer])
-                # Use the timestamp of the first message
-                first_timestamp = user_buffer[0]["timestamp"]
-                
-                # Add the merged user message
-                clean_pairs.append({
-                    "role": "user",
-                    "text": merged_text,
-                    "timestamp": first_timestamp
-                })
-                
-                # Clear the buffer and update last role
-                user_buffer = []
-                last_role_in_clean_pairs = "user"
-            
-            # If we have agent messages and the last role was user
-            if agent_buffer and last_role_in_clean_pairs == "user":
-                # Collect interrupted messages and final response
-                interrupted_texts = []
-                final_text = None
-                final_timestamp = None
-                
-                for item in agent_buffer:
-                    if item.get("was_interrupted", False):
-                        interrupted_texts.append(item["text"])
-                    else:
-                        # This is a complete response, not interrupted
-                        final_text = item["text"]
-                        final_timestamp = item["timestamp"]
-                
-                # If we have both interrupted texts and a final text, combine them
-                # Otherwise just use what we have
-                if interrupted_texts and final_text:
-                    # Create a message with interruption context
-                    merged_text = final_text
-                    clean_pairs.append({
-                        "role": "agent",
-                        "text": merged_text,
-                        "timestamp": final_timestamp,
-                        "interrupted_responses": interrupted_texts  # Store interrupted responses for context
-                    })
-                elif final_text:
-                    # Just a complete response
-                    clean_pairs.append({
-                        "role": "agent",
-                        "text": final_text,
-                        "timestamp": final_timestamp
-                    })
-                elif interrupted_texts:
-                    # Only have interrupted responses, use the last one
-                    clean_pairs.append({
-                        "role": "agent",
-                        "text": interrupted_texts[-1],
-                        "timestamp": agent_buffer[-1]["timestamp"],
-                        "was_interrupted": True
-                    })
-                
-                # Clear the buffer and update last role
-                agent_buffer = []
-                last_role_in_clean_pairs = "agent"
-        
-        # Add any incomplete turn for traditional format
-        if current_turn["user"] is not None:
-            turns.append(current_turn)
-        
-        # Handle any remaining buffers for clean pairs
-        # If we have user messages and they haven't been added yet
-        if user_buffer:
-            # We need to add these even if it breaks alternation
-            merged_text = " ".join([item["text"] for item in user_buffer])
-            first_timestamp = user_buffer[0]["timestamp"]
-            
-            clean_pairs.append({
-                "role": "user",
-                "text": merged_text,
-                "timestamp": first_timestamp
-            })
-        
-        # If we have agent messages and they haven't been added yet
-        if agent_buffer:
-            # Collect interrupted messages and final response
-            interrupted_texts = []
-            final_text = None
-            final_timestamp = None
-            
-            for item in agent_buffer:
-                if item.get("was_interrupted", False):
-                    interrupted_texts.append(item["text"])
-                else:
-                    # This is a complete response, not interrupted
-                    final_text = item["text"]
-                    final_timestamp = item["timestamp"]
-            
-            if final_text:
-                # Use the final complete response
-                clean_pairs.append({
-                    "role": "agent",
-                    "text": final_text,
-                    "timestamp": final_timestamp,
-                    "interrupted_responses": interrupted_texts if interrupted_texts else None
-                })
-            elif interrupted_texts:
-                # Only have interrupted responses, use the last one
-                clean_pairs.append({
-                    "role": "agent",
-                    "text": interrupted_texts[-1],
-                    "timestamp": agent_buffer[-1]["timestamp"],
-                    "was_interrupted": True
-                })
-        
-        return {
-            "chronological": chronological,  # Raw chronological data
-            "turns": turns,                  # Traditional turn-based format
-            "clean_pairs": clean_pairs       # Strictly alternating user-agent pairs
-        }
-
-    def start(self):
-        """Start listening for agent events"""
-        # Initialize the conversation in Supabase
-        asyncio.create_task(self.initialize_conversation())
-        
-        # Set up event listeners for agent speech
-        @self._agent.on("user_speech_committed")
-        def on_user_speech_committed(msg):
-            logger.info(f"User speech committed: {msg.content}")
-            self.add_exchange("user", msg.content)
-        
-        # Handle agent interruptions
-        @self._agent.on("agent_speech_interrupted")
-        def on_agent_speech_interrupted():
-            logger.info("Agent speech interrupted")
-            self._agent_interrupted = True
-            self._agent_speaking = False
-        
-        @self._agent.on("agent_started_speaking")
-        def on_agent_started_speaking():
-            logger.info("Agent started speaking")
-            self._agent_speaking = True
-            
-        # Capture agent speech when it finishes speaking
-        @self._agent.on("agent_stopped_speaking")
-        def on_agent_stopped_speaking():
-            # Try to extract the agent's speech using our helper
-            agent_text = AgentSpeechExtractor.get_agent_text(self._agent)
-            if agent_text:
-                logger.info(f"Agent stopped speaking: {agent_text[:50]}...")
-                self.add_exchange("agent", agent_text)
-            else:
-                logger.warning("Agent stopped speaking but no text was extracted")
-            
-            self._agent_speaking = False
-                
-        # Additional event listener for when the agent commits speech
-        @self._agent.on("agent_speech_committed")
-        def on_agent_speech_committed(msg):
-            if hasattr(msg, "content") and msg.content:
-                logger.info(f"Agent speech committed: {msg.content[:50]}...")
-                self.add_exchange("agent", msg.content)
-            else:
-                logger.warning("Agent speech committed but no content found in message")
-        
-        # Monitor LLM responses directly - for debugging only
-        @self._agent.on("llm_response")
-        def on_llm_response(response):
-            if hasattr(response, "content") and response.content:
-                logger.info(f"LLM response received: {response.content[:50]}...")
-                # We don't add this as it will be captured by other events
-        
-        # Capture text being sent to TTS
-        @self._agent.on("tts_start")
-        def on_tts_start(text):
-            logger.info(f"TTS started with text: {text[:50]}...")
-            self.add_exchange("agent", text)
-            
-        # Set up a periodic task to update the conversation with structured format
-        async def periodic_structured_update():
-            while True:
-                # Wait some time between updates
-                await asyncio.sleep(10)  # Update every 10 seconds
-                # Only update if we have messages
-                if self._conversation_data["exchanges"]:
-                    await self.update_with_structured_format()
-                
-        # Start the periodic update task
-        asyncio.create_task(periodic_structured_update())
-
-
-async def create_background_noise_ingress(ctx: JobContext):
-    """
-    Create an ingress to stream call center background noise into the room.
-    Uses URL_INPUT ingress type to stream an audio file with call center ambience.
-    """
-    logger.info(f"Creating call center background noise ingress for room {ctx.room.name}")
-    
-    try:
-        # Create an ingress with URL input for the background noise
-        ingress_info = await ctx.api.ingress.create_ingress(
-            api.CreateIngressRequest(
-                input_type=api.IngressInput.URL_INPUT,
-                name="call-center-background",
-                room_name=ctx.room.name,
-                participant_identity="background_noise",
-                participant_name="Call Center Background",
-                url=call_center_background_url,
-                audio=api.IngressAudioOptions(
-                    name="background_audio",
-                    
-                )
-            )
-        )
-        logger.info(f"Successfully created background noise ingress: {ingress_info.ingress_id}")
-        return ingress_info
-    except Exception as e:
-        logger.error(f"Failed to create background noise ingress: {e}")
-        return None
 
 
 async def entrypoint(ctx: JobContext):
     global _default_instructions, outbound_trunk_id
-    logger.info(f"connecting to room {ctx.room.name}")
+    logger.info(f"Connecting to room {ctx.room.name}")
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
     # Generate a unique conversation ID
@@ -697,15 +105,32 @@ async def entrypoint(ctx: JobContext):
     logger.info(f"Generated conversation ID: {conversation_id}")
 
     # Start background noise ingress before dialing
-    background_ingress = await create_background_noise_ingress(ctx)
-
+    logger.info("Starting background noise ingress for outbound agent...")
+    call_center_background_url = os.getenv("CALL_CENTER_BACKGROUND_URL", "https://cdn.freesound.org/previews/335/335711_5658680-lq.mp3")
+    
+    
+    background_ingress = await ctx.api.ingress.create_ingress(
+            api.CreateIngressRequest(
+                input_type=api.IngressInput.URL_INPUT,
+                name="call-center-background",
+                room_name=ctx.room.name,
+                participant_identity="background_noise",
+                participant_name="Call Center Background",
+                url=call_center_background_url
+        )
+    )
     if not background_ingress:
         logger.warning("Failed to create background noise ingress, continuing without background noise")
+    else:
+        logger.info(f"Background noise ingress created successfully with ID: {background_ingress.ingress_id}")
+        # Give the background noise a moment to start playing
+        logger.info("Pausing briefly to allow background noise to initialize...")
+        await asyncio.sleep(1.0)
 
     user_identity = "phone_user"
     # the phone number to dial is provided in the job metadata
     phone_number = ctx.job.metadata
-    logger.info(f"dialing {phone_number} to room {ctx.room.name}")
+    logger.info(f"Dialing {phone_number} to room {ctx.room.name}")
 
     # `create_sip_participant` starts dialing the user
     await ctx.api.sip.create_sip_participant(
@@ -719,6 +144,10 @@ async def entrypoint(ctx: JobContext):
 
     # a participant is created as soon as we start dialing
     participant = await ctx.wait_for_participant(identity=user_identity)
+    
+    # Log background noise status again to confirm it's still active
+    if background_ingress:
+        logger.info(f"Background noise should be playing now (ID: {background_ingress.ingress_id})")
 
     # use the VoicePipelineAgent and store the agent instance
     agent = run_voice_pipeline_agent(ctx, participant, _default_instructions, conversation_id)
@@ -793,14 +222,7 @@ async def entrypoint(ctx: JobContext):
         logger.error(f"Error during conversation cleanup: {e}")
     
     # Clean up background noise ingress if it was created
-    if background_ingress:
-        try:
-            await ctx.api.ingress.delete_ingress(
-                api.DeleteIngressRequest(ingress_id=background_ingress.ingress_id)
-            )
-            logger.info(f"Successfully deleted background noise ingress: {background_ingress.ingress_id}")
-        except Exception as e:
-            logger.error(f"Failed to delete background noise ingress: {e}")
+    await cleanup_background_noise_ingress(ctx, background_ingress)
     
     # Wait briefly to ensure all operations complete
     await asyncio.sleep(1.0)
@@ -840,7 +262,7 @@ def run_voice_pipeline_agent(
         stt=openai.stt.STT(
             model="whisper-1",
         ),
-        llm=openai.LLM(),
+        llm=openai.LLM(model="gpt-4o-mini"),
         tts=eleven_tts,
         chat_ctx=initial_ctx,
     )
@@ -880,5 +302,6 @@ if __name__ == "__main__":
             agent_name="outbound-caller",
             # prewarm by loading the VAD model, needed only for VoicePipelineAgent
             prewarm_fnc=prewarm,
+            port=6000,
         )
     )
